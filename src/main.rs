@@ -1,41 +1,25 @@
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
-struct Revision(u64);
+pub struct Revision(u64);
+
+static mut THREAD_REVISION: Revision = Revision(0);
 
 #[derive(Debug)]
-struct Graph {
-    revision: Revision,
+pub struct ThreadGraph;
+
+pub trait Graph {
+    fn revision(&self) -> Revision;
+    fn mark_as_modified(&mut self, other: &mut Revision);
 }
 
-impl Graph {
-    fn new() -> Self {
-        Self {
-            revision: Revision(0),
-        }
+impl Graph for ThreadGraph {
+    fn revision(&self) -> Revision {
+        unsafe { THREAD_REVISION }
     }
 
-    fn leaf<T>(&self, value: T) -> Leaf<T> {
-        Leaf {
-            value,
-            last_modified: self.revision,
-        }
-    }
-
-    fn branch<T>(&self, cached: T) -> Branch<T> {
-        Branch {
-            cached,
-            last_modified: self.revision,
-            last_verified: self.revision,
-        }
-    }
-
-    fn modify<T>(&mut self, leaf: &mut Leaf<T>, value: T)
-    where
-        T: Copy + PartialEq,
-    {
-        if leaf.value != value {
-            self.revision.0 += 1;
-            leaf.last_modified = self.revision;
-            leaf.value = value;
+    fn mark_as_modified(&mut self, other: &mut Revision) {
+        unsafe {
+            THREAD_REVISION.0 += 1;
+            *other = THREAD_REVISION;
         }
     }
 }
@@ -49,26 +33,23 @@ fn main() {
         SumAB,
     }
 
-    struct E {
-        graph: Graph,
-        a: Leaf<u32>,
-        b: Leaf<u32>,
-        c: Leaf<u32>,
-        sum_a_b: Branch<u32>,
+    struct E<G> {
+        a: Leaf<u32, G>,
+        b: Leaf<u32, G>,
+        c: Leaf<u32, G>,
+        sum_a_b: Branch<u32, G>,
         sum_a_b_computation_count: u32,
-        mul_c_sum_a_b: Branch<u32>,
+        mul_c_sum_a_b: Branch<u32, G>,
         mul_c_sum_a_b_computation_count: u32,
-        lhs: Leaf<ABC>,
-        rhs: Leaf<ABC>,
-        sum_dynamic: Branch<u32>,
+        lhs: Leaf<ABC, G>,
+        rhs: Leaf<ABC, G>,
+        sum_dynamic: Branch<u32, G>,
         sum_dynamic_computation_count: u32,
     }
 
-    impl E {
-        fn sum_a_b(&mut self) -> Value<u32> {
-            if self.sum_a_b.last_verified < self.graph.revision {
-                self.sum_a_b.last_verified = self.graph.revision;
-
+    impl<G: Graph> E<G> {
+        fn sum_a_b(&mut self) -> Revision {
+            if self.sum_a_b.verify() {
                 let last_modified = std::cmp::max(self.a.last_modified, self.b.last_modified);
 
                 if self.sum_a_b.last_modified < last_modified {
@@ -76,180 +57,214 @@ fn main() {
 
                     self.sum_a_b_computation_count += 1;
 
-                    self.sum_a_b.cached = self.a.value + self.b.value;
+                    self.sum_a_b.cached = *self.a + *self.b;
                 }
             }
-            Value {
-                value: self.sum_a_b.cached,
-                last_modified: self.sum_a_b.last_modified,
-            }
+            self.sum_a_b.last_modified
         }
 
-        fn mul_c_sum_a_b(&mut self) -> Value<u32> {
-            if self.mul_c_sum_a_b.last_verified < self.graph.revision {
-                self.mul_c_sum_a_b.last_verified = self.graph.revision;
-
-                let sum_a_b = self.sum_a_b();
-
-                let last_modified = std::cmp::max(self.c.last_modified, sum_a_b.last_modified);
+        fn mul_c_sum_a_b(&mut self) -> Revision {
+            if self.mul_c_sum_a_b.verify() {
+                let last_modified = std::cmp::max(self.c.last_modified, self.sum_a_b());
 
                 if self.mul_c_sum_a_b.last_modified < last_modified {
                     self.mul_c_sum_a_b.last_modified = last_modified;
 
                     self.mul_c_sum_a_b_computation_count += 1;
 
-                    self.mul_c_sum_a_b.cached = self.c.value * sum_a_b.value;
+                    self.mul_c_sum_a_b.cached = *self.c * *self.sum_a_b
                 }
             }
-            Value {
-                value: self.mul_c_sum_a_b.cached,
-                last_modified: self.mul_c_sum_a_b.last_modified,
-            }
+            self.mul_c_sum_a_b.last_modified
         }
 
-        fn sum_dynamic(&mut self) -> Value<u32> {
-            if self.sum_dynamic.last_verified < self.graph.revision {
-                self.sum_dynamic.last_verified = self.graph.revision;
-
-                let lhs = match self.lhs.value {
-                    ABC::A => Value {
-                        value: self.a.value,
-                        last_modified: self.a.last_modified,
-                    },
-                    ABC::B => Value {
-                        value: self.b.value,
-                        last_modified: self.b.last_modified,
-                    },
-                    ABC::C => Value {
-                        value: self.c.value,
-                        last_modified: self.c.last_modified,
-                    },
-                    ABC::SumAB => self.sum_a_b(),
-                };
-
-                let rhs = match self.rhs.value {
-                    ABC::A => Value {
-                        value: self.a.value,
-                        last_modified: self.a.last_modified,
-                    },
-                    ABC::B => Value {
-                        value: self.b.value,
-                        last_modified: self.b.last_modified,
-                    },
-                    ABC::C => Value {
-                        value: self.c.value,
-                        last_modified: self.c.last_modified,
-                    },
-                    ABC::SumAB => self.sum_a_b(),
-                };
-
-                let last_modified = [
-                    self.lhs.last_modified,
-                    lhs.last_modified,
-                    self.rhs.last_modified,
-                    rhs.last_modified,
-                ]
-                .iter()
-                .cloned()
-                .max()
-                .unwrap();
+        fn sum_dynamic(&mut self) -> Revision {
+            if self.sum_dynamic.verify() {
+                let last_modified = std::cmp::max(
+                    std::cmp::max(
+                        self.lhs.last_modified,
+                        match *self.lhs {
+                            ABC::A => self.a.last_modified,
+                            ABC::B => self.b.last_modified,
+                            ABC::C => self.c.last_modified,
+                            ABC::SumAB => self.sum_a_b(),
+                        },
+                    ),
+                    std::cmp::max(
+                        self.rhs.last_modified,
+                        match *self.rhs {
+                            ABC::A => self.a.last_modified,
+                            ABC::B => self.b.last_modified,
+                            ABC::C => self.c.last_modified,
+                            ABC::SumAB => self.sum_a_b(),
+                        },
+                    ),
+                );
 
                 if self.sum_dynamic.last_modified < last_modified {
                     self.sum_dynamic.last_modified = last_modified;
 
                     self.sum_dynamic_computation_count += 1;
 
-                    self.sum_dynamic.cached = lhs.value + rhs.value;
+                    self.sum_dynamic.cached = match *self.lhs {
+                        ABC::A => *self.a,
+                        ABC::B => *self.b,
+                        ABC::C => *self.c,
+                        ABC::SumAB => *self.sum_a_b,
+                    } + match *self.rhs {
+                        ABC::A => *self.a,
+                        ABC::B => *self.b,
+                        ABC::C => *self.c,
+                        ABC::SumAB => *self.sum_a_b,
+                    };
                 }
             }
-            Value {
-                value: self.sum_dynamic.cached,
-                last_modified: self.sum_dynamic.last_modified,
-            }
+            self.sum_dynamic.last_modified
         }
     }
 
     let mut e = {
-        let graph = Graph::new();
         E {
-            a: graph.leaf(1),
-            b: graph.leaf(2),
-            c: graph.leaf(3),
-            sum_a_b: graph.branch(1 + 2),
+            a: Leaf::new(1, ThreadGraph),
+            b: Leaf::new(2, ThreadGraph),
+            c: Leaf::new(3, ThreadGraph),
+            sum_a_b: Branch::new(1 + 2, ThreadGraph),
             sum_a_b_computation_count: 0,
-            mul_c_sum_a_b: graph.branch(3 * (1 + 2)),
+            mul_c_sum_a_b: Branch::new(3 * (1 + 2), ThreadGraph),
             mul_c_sum_a_b_computation_count: 0,
-            lhs: graph.leaf(ABC::A),
-            rhs: graph.leaf(ABC::B),
-            sum_dynamic: graph.branch(1 + 2),
+            lhs: Leaf::new(ABC::A, ThreadGraph),
+            rhs: Leaf::new(ABC::B, ThreadGraph),
+            sum_dynamic: Branch::new(1 + 2, ThreadGraph),
             sum_dynamic_computation_count: 0,
-            graph,
         }
     };
 
     // a = 1
     // b = 2
     // c = 3
-    assert_eq!(9, *e.mul_c_sum_a_b());
+    assert_eq!(9, {
+        e.mul_c_sum_a_b();
+        *e.mul_c_sum_a_b
+    });
     assert_eq!(0, e.sum_a_b_computation_count);
     assert_eq!(0, e.mul_c_sum_a_b_computation_count);
     assert_eq!(0, e.sum_dynamic_computation_count);
 
-    e.graph.modify(&mut e.b, 6);
+    e.b.modify(6);
 
     // a = 1
     // b = 6
     // c = 3
-    assert_eq!(21, *e.mul_c_sum_a_b());
+    assert_eq!((7, 21), {
+        e.mul_c_sum_a_b();
+        (*e.sum_a_b, *e.mul_c_sum_a_b)
+    });
     assert_eq!(1, e.sum_a_b_computation_count);
     assert_eq!(1, e.mul_c_sum_a_b_computation_count);
     assert_eq!(0, e.sum_dynamic_computation_count);
 
-    e.graph.modify(&mut e.lhs, ABC::C);
+    e.lhs.modify(ABC::C);
 
     // a = 1
     // b = 6
     // c = 3
-    assert_eq!(9, *e.sum_dynamic());
+    assert_eq!(9, {
+        e.sum_dynamic();
+        *e.sum_dynamic
+    });
     assert_eq!(1, e.sum_a_b_computation_count);
     assert_eq!(1, e.mul_c_sum_a_b_computation_count);
     assert_eq!(1, e.sum_dynamic_computation_count);
 
-    e.graph.modify(&mut e.rhs, ABC::SumAB);
+    e.rhs.modify(ABC::SumAB);
 
-    assert_eq!(10, *e.sum_dynamic());
+    assert_eq!(10, {
+        e.sum_dynamic();
+        *e.sum_dynamic
+    });
     assert_eq!(1, e.sum_a_b_computation_count);
     assert_eq!(1, e.mul_c_sum_a_b_computation_count);
     assert_eq!(2, e.sum_dynamic_computation_count);
 
-    e.graph.modify(&mut e.a, 20);
+    e.a.modify(20);
 
-    assert_eq!(29, *e.sum_dynamic());
+    assert_eq!(29, {
+        e.sum_dynamic();
+        *e.sum_dynamic
+    });
     assert_eq!(2, e.sum_a_b_computation_count);
     assert_eq!(1, e.mul_c_sum_a_b_computation_count);
     assert_eq!(3, e.sum_dynamic_computation_count);
 }
 
-struct Leaf<T> {
+struct Leaf<T, G> {
     value: T,
     last_modified: Revision,
+    graph: G,
 }
 
-struct Branch<T> {
-    cached: T,
-    last_modified: Revision,
-    last_verified: Revision,
+impl<T: Copy + PartialEq, G: Graph> Leaf<T, G> {
+    fn new(value: T, graph: G) -> Self {
+        Self {
+            value,
+            last_modified: graph.revision(),
+            graph,
+        }
+    }
+
+    fn modify(&mut self, value: T) {
+        if self.value != value {
+            self.graph.mark_as_modified(&mut self.last_modified);
+            self.value = value;
+        }
+    }
 }
 
-struct Value<T> {
-    value: T,
-    last_modified: Revision,
-}
-
-impl<T> std::ops::Deref for Value<T> {
+impl<T, G> std::ops::Deref for Leaf<T, G> {
     type Target = T;
 
     fn deref(&self) -> &T {
         &self.value
+    }
+}
+
+pub struct Branch<T, G> {
+    cached: T,
+    last_modified: Revision,
+    last_verified: Revision,
+    graph: G,
+}
+
+impl<T, G: Graph> Branch<T, G> {
+    pub fn new(cached: T, graph: G) -> Self {
+        Self {
+            cached,
+            last_modified: graph.revision(),
+            last_verified: graph.revision(),
+            graph,
+        }
+    }
+
+    pub fn verify(&mut self) -> bool {
+        let revision = self.graph.revision();
+        if self.last_verified < revision {
+            self.last_verified = revision;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl<T, G: Graph> std::ops::Deref for Branch<T, G> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        let revision = self.graph.revision();
+        if self.last_verified < revision {
+            panic!("Dereferenced outdated branch!");
+        }
+        &self.cached
     }
 }
