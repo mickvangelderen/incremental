@@ -1,5 +1,5 @@
 [package]
-name = "inc-lab"
+name = "incremental"
 version = "0.1.0"
 authors = ["Mick van Gelderen <mickvangelderen@gmail.com>"]
 edition = "2018"

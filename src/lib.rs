@@ -1,325 +1,229 @@
-pub mod ic {
-    #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
-    pub struct Revision(u64);
+//! This minimalistic crate provides some tools to facilitate implementing
+//! single threaded incremental computation. There are other projects like salsa
+//! and adapton which might better suit your needs.
+//!
+//! I had a need for something simple in my OpenGL application where I wanted to
+//! recompile shaders on the fly whenever files or configuration changes.
+//!
+//! To do incremental computation you'll likely create a struct to hold your
+//! graph. On this struct you will implement methods that query values from the
+//! graph and recompute them if needed. It is best to check out the tests to see
+//! how this library can help you achieve that ergonomically.
+//!
+//! My initial designs did not use RefCell. It is possible to implement things
+//! by separating the updating pass and the reference obtaining pass. The
+//! resulting code is easy to mess up because of this duplication. On the
+//! reference obtaining pass we lose some performance because we are checking if
+//! the values are all actually up-to-date to prevent programming mistakes. We
+//! would also have to find a way to get element level borrow checking when
+//! using collections. You're now paying heavily in ergonomics and it will
+//! become tempting to work around the incremental computation system. With
+//! these realizations I finally felt comfortable resorting to run-time borrow
+//! checking by integrating RefCell.
 
-    #[derive(Debug)]
-    pub struct Graph {
-        pub revision: Revision,
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct Revision(u64);
+
+/// A Graph represents a network of values which are lazily recomputed.
+/// Graph itself only keeps track of its global revision.
+///
+/// It is on you to ensure leaves and branches are only used with the graph
+/// they were created in. If you are creating more than one but a fixed
+/// number of graphs it might be worthwile to add a zero sized type
+/// parameter to keep the graphs apart. This isn't part of the core library
+/// but might be some day.
+
+#[derive(Debug)]
+pub struct Graph {
+    revision: Revision,
+}
+
+impl Graph {
+    pub fn new() -> Self {
+        Self {
+            revision: Revision(0),
+        }
     }
 
-    impl Graph {
-        pub fn new() -> Self {
-            Self {
-                revision: Revision(0),
-            }
-        }
+    fn inc(&mut self) {
+        self.revision.0 += 1;
+    }
 
-        fn inc(&mut self) {
-            self.revision.0 += 1;
+    #[inline]
+    pub fn replace<T: PartialEq>(&mut self, leaf: &mut Leaf<T>, value: T) -> T {
+        if value == leaf.value {
+            value
+        } else {
+            self.replace_always(leaf, value)
         }
+    }
 
-        #[inline]
-        pub fn replace<T: PartialEq>(&mut self, leaf: &mut Leaf<T>, value: T) -> T {
-            if value == leaf.value {
-                value
-            } else {
-                self.inc();
-                leaf.last_modified = self.revision;
-                std::mem::replace(&mut leaf.value, value)
-            }
+    #[inline]
+    pub fn replace_always<T>(&mut self, leaf: &mut Leaf<T>, value: T) -> T {
+        self.inc();
+        leaf.last_modified = self.revision;
+        std::mem::replace(&mut leaf.value, value)
+    }
+
+    #[inline]
+    pub fn leaf<T>(&self, value: T) -> Leaf<T> {
+        Leaf {
+            value,
+            last_modified: self.revision,
         }
+    }
 
-        #[inline]
-        pub fn leaf<T>(&self, value: T) -> Leaf<T> {
-            Leaf {
+    #[inline]
+    pub fn branch<T>(&self, value: T) -> Branch<T> {
+        Branch {
+            inner: std::cell::RefCell::new(BranchInner {
                 value,
+                last_verified: self.revision,
                 last_modified: self.revision,
-            }
-        }
-
-        #[inline]
-        pub fn branch<T>(&self, value: T) -> Branch<T> {
-            Branch {
-                inner: std::cell::RefCell::new(BranchInner {
-                    value,
-                    last_verified: self.revision,
-                    last_modified: self.revision,
-                }),
-            }
-        }
-    }
-
-    pub struct Leaf<T> {
-        pub value: T,
-        pub last_modified: Revision,
-    }
-
-    impl<T> Leaf<T> {
-        pub fn read(&self, token: &mut impl Token) -> &T {
-            token.update(self.last_modified);
-            &self.value
-        }
-    }
-
-    struct BranchInner<T> {
-        pub value: T,
-        pub last_modified: Revision,
-        pub last_verified: Revision,
-    }
-
-    pub struct Branch<T> {
-        inner: std::cell::RefCell<BranchInner<T>>,
-    }
-
-    impl<T> Branch<T> {
-        pub fn verify<'a>(
-            &'a self,
-            graph: &'a Graph,
-            token: &mut impl Token,
-            f: impl FnOnce(&mut ParentToken<T>),
-        ) -> BranchRef<'a, T> {
-            match self.inner.try_borrow_mut() {
-                Ok(mut borrow) => {
-                    if borrow.last_verified < graph.revision {
-                        borrow.last_verified = graph.revision;
-
-                        let mut token = ParentToken {
-                            last_modified: borrow.last_modified,
-                            borrow,
-                        };
-
-                        f(&mut token);
-
-                        debug_assert!(token.borrow.last_modified == token.last_modified, "Forgot to compute!");
-                    }
-                }
-                Err(_) => {
-                    // Branch has already been borrowed which means that it must
-                    // also have already been verified for the current graph.
-                }
-            }
-            let borrow = self
-                .inner
-                .try_borrow()
-                .expect("Cycle detected in dependency graph!");
-
-            token.update(borrow.last_modified);
-
-            BranchRef(std::cell::Ref::map(borrow, |branch| &branch.value))
-        }
-    }
-
-    pub struct BranchRef<'a, T>(std::cell::Ref<'a, T>);
-
-    impl<T> std::ops::Deref for BranchRef<'_, T> {
-        type Target = T;
-
-        fn deref(&self) -> &Self::Target {
-            &self.0
-        }
-    }
-
-    pub trait Token {
-        fn update(&mut self, revision: Revision);
-    }
-
-    pub struct RootToken;
-
-    impl Token for RootToken {
-        fn update(&mut self, _revision: Revision) {
-            // Do nothing.
-        }
-    }
-
-    pub struct ParentToken<'a, T> {
-        last_modified: Revision,
-        borrow: std::cell::RefMut<'a, BranchInner<T>>,
-    }
-
-    impl<'a, T> ParentToken<'a, T> {
-        pub fn compute(&mut self, f: impl FnOnce(&mut T)) {
-            if self.borrow.last_modified < self.last_modified {
-                self.borrow.last_modified = self.last_modified;
-
-                f(&mut self.borrow.value);
-            }
-        }
-    }
-
-    impl<T> Token for ParentToken<'_, T> {
-        fn update(&mut self, revision: Revision) {
-            if self.last_modified < revision {
-                self.last_modified = revision
-            }
-        }
-    }
-
-    impl<'a, T> Drop for ParentToken<'a, T> {
-        fn drop(&mut self) {
-            if !std::thread::panicking() {
-                if self.borrow.last_modified < self.last_modified {
-                    panic!("Forgot to recompute!");
-                }
-            }
+            }),
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::ic::{Branch, BranchRef, Graph, RootToken, Leaf, Token};
+/// A leaf represents an input. It can be directly modified. Doing so will
+/// increment the revision of the graph, ensuring branches will recompute
+/// their values when queried if necessary.
+pub struct Leaf<T> {
+    value: T,
+    last_modified: Revision,
+}
 
-    #[test]
-    fn main() {
-        #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-        enum ABC {
-            A,
-            B,
-            C,
-            SumAB,
-        }
-
-        struct E {
-            graph: Graph,
-            a: Leaf<u32>,
-            b: Leaf<u32>,
-            c: Leaf<u32>,
-            sum_a_b: Branch<u32>,
-            mul_c_sum_a_b: Branch<u32>,
-            lhs: Leaf<ABC>,
-            rhs: Leaf<ABC>,
-            sum_dynamic: Branch<u32>,
-        }
-
-        impl E {
-            fn sum_a_b(&self, token: &mut impl Token) -> BranchRef<u32> {
-                self.sum_a_b.verify(&self.graph, token, |token| {
-                    let a = *self.a.read(token);
-                    let b = *self.b.read(token);
-                    token.compute(|value| {
-                        *value = a + b;
-                    })
-                })
-            }
-
-            fn mul_c_sum_a_b(&self, token: &mut impl Token) -> BranchRef<u32> {
-                self.mul_c_sum_a_b.verify(&self.graph, token, |token| {
-                    let c = *self.c.read(token);
-                    let sum_a_b = *self.sum_a_b(token);
-                    token.compute(|value| {
-                        *value = c * sum_a_b;
-                    })
-                })
-            }
-
-            fn sum_dynamic(&self, token: &mut impl Token) -> BranchRef<u32> {
-                self.sum_dynamic.verify(&self.graph, token, |token| {
-                    let lhs = match *self.lhs.read(token) {
-                        ABC::A => *self.a.read(token),
-                        ABC::B => *self.b.read(token),
-                        ABC::C => *self.c.read(token),
-                        ABC::SumAB => *self.sum_a_b(token),
-                    };
-
-                    let rhs = match *self.rhs.read(token) {
-                        ABC::A => *self.a.read(token),
-                        ABC::B => *self.b.read(token),
-                        ABC::C => *self.c.read(token),
-                        ABC::SumAB => *self.sum_a_b(token),
-                    };
-
-                    token.compute(|value| *value = lhs + rhs)
-                })
-            }
-        }
-
-        let mut e = {
-            let graph = Graph::new();
-            E {
-                a: graph.leaf(1),
-                b: graph.leaf(2),
-                c: graph.leaf(3),
-                sum_a_b: graph.branch(1 + 2),
-                mul_c_sum_a_b: graph.branch(3 * (1 + 2)),
-                lhs: graph.leaf(ABC::A),
-                rhs: graph.leaf(ABC::B),
-                sum_dynamic: graph.branch(1 + 2),
-                graph,
-            }
-        };
-
-        // a = 1
-        // b = 2
-        // c = 3
-        assert_eq!(3, *e.sum_a_b(&mut RootToken));
-
-        e.graph.replace(&mut e.b, 6);
-
-        // a = 1
-        // b = 6
-        // c = 3
-        assert_eq!(7, *e.sum_a_b(&mut RootToken));
-        assert_eq!(21, *e.mul_c_sum_a_b(&mut RootToken));
-
-        e.graph.replace(&mut e.lhs, ABC::C);
-
-        // a = 1
-        // b = 6
-        // c = 3
-        assert_eq!(9, *e.sum_dynamic(&mut RootToken));
-
-        e.graph.replace(&mut e.rhs, ABC::SumAB);
-
-        assert_eq!(10, *e.sum_dynamic(&mut RootToken));
-
-        e.graph.replace(&mut e.a, 20);
-
-        assert_eq!(29, *e.sum_dynamic(&mut RootToken));
+impl<T> Leaf<T> {
+    pub fn read(&self, token: &mut impl Token) -> &T {
+        token.update(self.last_modified);
+        &self.value
     }
+}
 
-    #[test]
-    #[should_panic(expected = "Cycle detected in dependency graph!")]
-    fn panic_if_dependency_graph_contains_a_cycle() {
-        struct E {
-            ignite: Leaf<u32>,
-            a: Branch<u32>,
-            b: Branch<u32>,
-            graph: Graph,
+struct BranchInner<T> {
+    value: T,
+    last_modified: Revision,
+    last_verified: Revision,
+}
+
+/// A branch represents a lazily computed cached value. Usually a function
+/// will be dedicated to computing the cased value. This function should
+/// call `verify`.
+pub struct Branch<T> {
+    inner: std::cell::RefCell<BranchInner<T>>,
+}
+
+impl<T> Branch<T> {
+    /// The passed closure will be called recomputation is required. A
+    /// branch keeps track of the last time verify was called so that we can
+    /// stop recomputation early when the graph has not been updated at all.
+    ///
+    /// If the graph has been updated since the last verification, the
+    /// passed closure will be called. The closure receives a `ParentToken`
+    /// that should be used to obtain depended-upon Leaf or Branch
+    /// references.
+    ///
+    /// After obtaining all dependencies, `compute` must be called on the
+    /// token.
+    pub fn verify<'a>(
+        &'a self,
+        graph: &'a Graph,
+        token: &mut impl Token,
+        f: impl FnOnce(&mut ParentToken<T>),
+    ) -> BranchRef<'a, T> {
+        match self.inner.try_borrow_mut() {
+            Ok(mut borrow) => {
+                if borrow.last_verified < graph.revision {
+                    borrow.last_verified = graph.revision;
+
+                    let mut token = ParentToken {
+                        last_modified: borrow.last_modified,
+                        borrow,
+                    };
+
+                    f(&mut token);
+
+                    debug_assert!(
+                        token.borrow.last_modified == token.last_modified,
+                        "Forgot to call compute!"
+                    );
+                }
+            }
+            Err(_) => {
+                // Branch has already been borrowed which means that it must
+                // also have already been verified for the current graph.
+            }
         }
+        let borrow = self
+            .inner
+            .try_borrow()
+            .expect("Cycle detected in dependency graph!");
 
-        impl E {
-            fn a(&self, token: &mut impl Token) -> BranchRef<u32> {
-                self.a.verify(&self.graph, token, |token| {
-                    let ignite = *self.ignite.read(token);
-                    let b = *self.b(token);
-                    token.compute(|value: &mut u32| {
-                        *value = ignite + b;
-                    })
-                })
-            }
+        token.update(borrow.last_modified);
 
-            fn b(&self, token: &mut impl Token) -> BranchRef<u32> {
-                self.b.verify(&self.graph, token, |token| {
-                    let a = *self.a(token);
-                    token.compute(|value: &mut u32| {
-                        *value = a + 1;
-                    })
-                })
-            }
+        BranchRef::new(graph, borrow)
+    }
+}
+
+/// A reference to a branch value from the graph. The graph cannot be
+/// mutated while a reference exists, ensuring the value is up-to-date.
+pub struct BranchRef<'a, T>(std::cell::Ref<'a, T>);
+
+impl<'a, T> BranchRef<'a, T> {
+    fn new(_graph: &'a Graph, borrow: std::cell::Ref<'a, BranchInner<T>>) -> Self {
+        BranchRef(std::cell::Ref::map(borrow, |branch| &branch.value))
+    }
+}
+
+impl<T> std::ops::Deref for BranchRef<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Abstracts the tracking of the latest last_modified value of all
+/// dependencies.
+pub trait Token {
+    fn update(&mut self, revision: Revision);
+}
+
+/// Graph queries need to start somewhere. Do not use this inside
+/// incremental computations. The verify function provides you with a
+/// ParentToken.
+pub struct RootToken;
+
+impl Token for RootToken {
+    fn update(&mut self, _revision: Revision) {
+        // Do nothing.
+    }
+}
+
+/// Tracks the latest last_modified value of all dependencies. After
+/// obtaining references to all dependencies, the compute function must be
+/// called.
+pub struct ParentToken<'a, T> {
+    last_modified: Revision,
+    borrow: std::cell::RefMut<'a, BranchInner<T>>,
+}
+
+impl<'a, T> ParentToken<'a, T> {
+    /// Will execute the passed closure when one of the dependencies has
+    /// been modified since the last execution.
+    pub fn compute(&mut self, f: impl FnOnce(&mut T)) {
+        if self.borrow.last_modified < self.last_modified {
+            self.borrow.last_modified = self.last_modified;
+
+            f(&mut self.borrow.value);
         }
+    }
+}
 
-        let mut e = {
-            let graph = Graph::new();
-            E {
-                ignite: graph.leaf(0),
-                a: graph.branch(0),
-                b: graph.branch(0),
-                graph
-            }
-        };
-
-        e.graph.replace(&mut e.ignite, 1);
-
-        let _ = e.a(&mut RootToken);
+impl<T> Token for ParentToken<'_, T> {
+    fn update(&mut self, revision: Revision) {
+        if self.last_modified < revision {
+            self.last_modified = revision
+        }
     }
 }
