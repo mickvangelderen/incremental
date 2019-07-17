@@ -55,7 +55,7 @@ pub mod ic {
     }
 
     impl<T> Leaf<T> {
-        pub fn read(&self, mut token: impl Token) -> &T {
+        pub fn read(&self, token: &mut impl Token) -> &T {
             token.update(self.last_modified);
             &self.value
         }
@@ -75,18 +75,22 @@ pub mod ic {
         pub fn verify<'a>(
             &'a self,
             graph: &'a Graph,
-            mut token: impl Token,
-            f: impl FnOnce(ParentToken<T>),
+            token: &mut impl Token,
+            f: impl FnOnce(&mut ParentToken<T>),
         ) -> BranchRef<'a, T> {
             match self.inner.try_borrow_mut() {
                 Ok(mut borrow) => {
                     if borrow.last_verified < graph.revision {
                         borrow.last_verified = graph.revision;
 
-                        f(ParentToken {
+                        let mut token = ParentToken {
                             last_modified: borrow.last_modified,
                             borrow,
-                        })
+                        };
+
+                        f(&mut token);
+
+                        debug_assert!(token.borrow.last_modified == token.last_modified, "Forgot to compute!");
                     }
                 }
                 Err(_) => {
@@ -133,7 +137,7 @@ pub mod ic {
     }
 
     impl<'a, T> ParentToken<'a, T> {
-        pub fn compute(mut self, f: impl FnOnce(&mut T)) {
+        pub fn compute(&mut self, f: impl FnOnce(&mut T)) {
             if self.borrow.last_modified < self.last_modified {
                 self.borrow.last_modified = self.last_modified;
 
@@ -142,7 +146,7 @@ pub mod ic {
         }
     }
 
-    impl<'a, T> Token for &mut ParentToken<'a, T> {
+    impl<T> Token for ParentToken<'_, T> {
         fn update(&mut self, revision: Revision) {
             if self.last_modified < revision {
                 self.last_modified = revision
@@ -188,40 +192,40 @@ mod tests {
         }
 
         impl E {
-            fn sum_a_b(&self, token: impl Token) -> BranchRef<u32> {
-                self.sum_a_b.verify(&self.graph, token, |mut token| {
-                    let a = *self.a.read(&mut token);
-                    let b = *self.b.read(&mut token);
+            fn sum_a_b(&self, token: &mut impl Token) -> BranchRef<u32> {
+                self.sum_a_b.verify(&self.graph, token, |token| {
+                    let a = *self.a.read(token);
+                    let b = *self.b.read(token);
                     token.compute(|value| {
                         *value = a + b;
-                    });
+                    })
                 })
             }
 
-            fn mul_c_sum_a_b(&self, token: impl Token) -> BranchRef<u32> {
-                self.mul_c_sum_a_b.verify(&self.graph, token, |mut token| {
-                    let c = *self.c.read(&mut token);
-                    let sum_a_b = *self.sum_a_b(&mut token);
+            fn mul_c_sum_a_b(&self, token: &mut impl Token) -> BranchRef<u32> {
+                self.mul_c_sum_a_b.verify(&self.graph, token, |token| {
+                    let c = *self.c.read(token);
+                    let sum_a_b = *self.sum_a_b(token);
                     token.compute(|value| {
                         *value = c * sum_a_b;
                     })
                 })
             }
 
-            fn sum_dynamic(&self, token: impl Token) -> BranchRef<u32> {
-                self.sum_dynamic.verify(&self.graph, token, |mut token| {
-                    let lhs = match *self.lhs.read(&mut token) {
-                        ABC::A => *self.a.read(&mut token),
-                        ABC::B => *self.b.read(&mut token),
-                        ABC::C => *self.c.read(&mut token),
-                        ABC::SumAB => *self.sum_a_b(&mut token),
+            fn sum_dynamic(&self, token: &mut impl Token) -> BranchRef<u32> {
+                self.sum_dynamic.verify(&self.graph, token, |token| {
+                    let lhs = match *self.lhs.read(token) {
+                        ABC::A => *self.a.read(token),
+                        ABC::B => *self.b.read(token),
+                        ABC::C => *self.c.read(token),
+                        ABC::SumAB => *self.sum_a_b(token),
                     };
 
-                    let rhs = match *self.rhs.read(&mut token) {
-                        ABC::A => *self.a.read(&mut token),
-                        ABC::B => *self.b.read(&mut token),
-                        ABC::C => *self.c.read(&mut token),
-                        ABC::SumAB => *self.sum_a_b(&mut token),
+                    let rhs = match *self.rhs.read(token) {
+                        ABC::A => *self.a.read(token),
+                        ABC::B => *self.b.read(token),
+                        ABC::C => *self.c.read(token),
+                        ABC::SumAB => *self.sum_a_b(token),
                     };
 
                     token.compute(|value| *value = lhs + rhs)
@@ -247,30 +251,30 @@ mod tests {
         // a = 1
         // b = 2
         // c = 3
-        assert_eq!(3, *e.sum_a_b(RootToken));
+        assert_eq!(3, *e.sum_a_b(&mut RootToken));
 
         e.graph.replace(&mut e.b, 6);
 
         // a = 1
         // b = 6
         // c = 3
-        assert_eq!(7, *e.sum_a_b(RootToken));
-        assert_eq!(21, *e.mul_c_sum_a_b(RootToken));
+        assert_eq!(7, *e.sum_a_b(&mut RootToken));
+        assert_eq!(21, *e.mul_c_sum_a_b(&mut RootToken));
 
         e.graph.replace(&mut e.lhs, ABC::C);
 
         // a = 1
         // b = 6
         // c = 3
-        assert_eq!(9, *e.sum_dynamic(RootToken));
+        assert_eq!(9, *e.sum_dynamic(&mut RootToken));
 
         e.graph.replace(&mut e.rhs, ABC::SumAB);
 
-        assert_eq!(10, *e.sum_dynamic(RootToken));
+        assert_eq!(10, *e.sum_dynamic(&mut RootToken));
 
         e.graph.replace(&mut e.a, 20);
 
-        assert_eq!(29, *e.sum_dynamic(RootToken));
+        assert_eq!(29, *e.sum_dynamic(&mut RootToken));
     }
 
     #[test]
@@ -284,22 +288,22 @@ mod tests {
         }
 
         impl E {
-            fn a(&self, token: impl Token) -> BranchRef<u32> {
-                self.a.verify(&self.graph, token, |mut token| {
-                    let ignite = *self.ignite.read(&mut token);
-                    let b = *self.b(&mut token);
-                    token.compute(|value| {
+            fn a(&self, token: &mut impl Token) -> BranchRef<u32> {
+                self.a.verify(&self.graph, token, |token| {
+                    let ignite = *self.ignite.read(token);
+                    let b = *self.b(token);
+                    token.compute(|value: &mut u32| {
                         *value = ignite + b;
-                    });
+                    })
                 })
             }
 
-            fn b(&self, token: impl Token) -> BranchRef<u32> {
-                self.b.verify(&self.graph, token, |mut token| {
-                    let a = *self.a(&mut token);
-                    token.compute(|value| {
+            fn b(&self, token: &mut impl Token) -> BranchRef<u32> {
+                self.b.verify(&self.graph, token, |token| {
+                    let a = *self.a(token);
+                    token.compute(|value: &mut u32| {
                         *value = a + 1;
-                    });
+                    })
                 })
             }
         }
@@ -316,6 +320,6 @@ mod tests {
 
         e.graph.replace(&mut e.ignite, 1);
 
-        let _ = e.a(RootToken);
+        let _ = e.a(&mut RootToken);
     }
 }
