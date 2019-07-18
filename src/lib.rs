@@ -26,6 +26,9 @@ use std::cell::{Ref, RefCell, RefMut};
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Revision(u64);
 
+const DIRTY_BRANCH: Revision = Revision(0);
+const INITIAL_GRAPH: Revision = Revision(1);
+
 /// A Graph represents a network of values which are lazily recomputed.
 /// Graph itself only keeps track of its global revision.
 ///
@@ -42,11 +45,17 @@ pub struct Graph {
 
 impl Graph {
     pub fn new() -> Self {
-        Self { revision: Revision(0) }
+        Self {
+            revision: INITIAL_GRAPH,
+        }
     }
 
     fn inc(&mut self) {
         self.revision.0 += 1;
+    }
+
+    fn revision(&self) -> Revision {
+        self.revision
     }
 
     #[inline]
@@ -73,8 +82,23 @@ impl Graph {
         }
     }
 
+    /// A dirty branch has a last_verified and last_modified that is guaranteed
+    /// to be before any leaf's last_modified, causing it to always recompute on
+    /// the first access.
     #[inline]
     pub fn branch<T>(&self, value: T) -> Branch<T> {
+        Branch {
+            inner: RefCell::new(BranchInner {
+                value,
+                last_verified: DIRTY_BRANCH,
+                last_modified: DIRTY_BRANCH,
+            }),
+        }
+    }
+
+    /// A clean branch will not recompute until dependencies are modified.
+    #[inline]
+    pub fn clean_branch<T>(&self, value: T) -> Branch<T> {
         Branch {
             inner: RefCell::new(BranchInner {
                 value,
@@ -136,8 +160,8 @@ impl<T> Branch<T> {
     ) -> Ref<'a, T> {
         match self.inner.try_borrow_mut() {
             Ok(mut borrow) => {
-                if borrow.last_verified < graph.revision {
-                    borrow.last_verified = graph.revision;
+                if borrow.last_verified < graph.revision() {
+                    borrow.last_verified = graph.revision();
 
                     let mut token = ParentToken {
                         last_modified: borrow.last_modified,
