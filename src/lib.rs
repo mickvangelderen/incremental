@@ -88,6 +88,7 @@ impl Graph {
 /// A leaf represents an input. It can be directly modified. Doing so will
 /// increment the revision of the graph, ensuring branches will recompute
 /// their values when queried if necessary.
+#[derive(Debug)]
 pub struct Leaf<T> {
     value: T,
     last_modified: Revision,
@@ -100,6 +101,7 @@ impl<T> Leaf<T> {
     }
 }
 
+#[derive(Debug)]
 struct BranchInner<T> {
     value: T,
     last_modified: Revision,
@@ -109,6 +111,7 @@ struct BranchInner<T> {
 /// A branch represents a lazily computed cached value. Usually a function
 /// will be dedicated to computing the cased value. This function should
 /// call `verify`.
+#[derive(Debug)]
 pub struct Branch<T> {
     inner: RefCell<BranchInner<T>>,
 }
@@ -171,6 +174,7 @@ pub trait Token {
 /// Graph queries need to start somewhere. Do not use this inside
 /// incremental computations. The verify function provides you with a
 /// ParentToken.
+#[derive(Debug)]
 pub struct RootToken;
 
 impl Token for RootToken {
@@ -182,6 +186,7 @@ impl Token for RootToken {
 /// Tracks the latest last_modified value of all dependencies. After
 /// obtaining references to all dependencies, the compute function must be
 /// called.
+#[derive(Debug)]
 pub struct ParentToken<'a, T> {
     last_modified: Revision,
     borrow: RefMut<'a, BranchInner<T>>,
