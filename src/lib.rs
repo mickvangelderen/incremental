@@ -21,6 +21,8 @@
 //! these realizations I finally felt comfortable resorting to run-time borrow
 //! checking by integrating RefCell.
 
+use std::cell::{Ref, RefCell, RefMut};
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Revision(u64);
 
@@ -40,9 +42,7 @@ pub struct Graph {
 
 impl Graph {
     pub fn new() -> Self {
-        Self {
-            revision: Revision(0),
-        }
+        Self { revision: Revision(0) }
     }
 
     fn inc(&mut self) {
@@ -76,7 +76,7 @@ impl Graph {
     #[inline]
     pub fn branch<T>(&self, value: T) -> Branch<T> {
         Branch {
-            inner: std::cell::RefCell::new(BranchInner {
+            inner: RefCell::new(BranchInner {
                 value,
                 last_verified: self.revision,
                 last_modified: self.revision,
@@ -110,7 +110,7 @@ struct BranchInner<T> {
 /// will be dedicated to computing the cased value. This function should
 /// call `verify`.
 pub struct Branch<T> {
-    inner: std::cell::RefCell<BranchInner<T>>,
+    inner: RefCell<BranchInner<T>>,
 }
 
 impl<T> Branch<T> {
@@ -130,7 +130,7 @@ impl<T> Branch<T> {
         graph: &'a Graph,
         token: &mut impl Token,
         f: impl FnOnce(&mut ParentToken<T>),
-    ) -> BranchRef<'a, T> {
+    ) -> Ref<'a, T> {
         match self.inner.try_borrow_mut() {
             Ok(mut borrow) => {
                 if borrow.last_verified < graph.revision {
@@ -154,32 +154,11 @@ impl<T> Branch<T> {
                 // also have already been verified for the current graph.
             }
         }
-        let borrow = self
-            .inner
-            .try_borrow()
-            .expect("Cycle detected in dependency graph!");
+        let borrow = self.inner.try_borrow().expect("Cycle detected in dependency graph!");
 
         token.update(borrow.last_modified);
 
-        BranchRef::new(graph, borrow)
-    }
-}
-
-/// A reference to a branch value from the graph. The graph cannot be
-/// mutated while a reference exists, ensuring the value is up-to-date.
-pub struct BranchRef<'a, T>(std::cell::Ref<'a, T>);
-
-impl<'a, T> BranchRef<'a, T> {
-    fn new(_graph: &'a Graph, borrow: std::cell::Ref<'a, BranchInner<T>>) -> Self {
-        BranchRef(std::cell::Ref::map(borrow, |branch| &branch.value))
-    }
-}
-
-impl<T> std::ops::Deref for BranchRef<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
+        Ref::map(borrow, |&BranchInner { ref value, .. }| value)
     }
 }
 
@@ -205,7 +184,7 @@ impl Token for RootToken {
 /// called.
 pub struct ParentToken<'a, T> {
     last_modified: Revision,
-    borrow: std::cell::RefMut<'a, BranchInner<T>>,
+    borrow: RefMut<'a, BranchInner<T>>,
 }
 
 impl<'a, T> ParentToken<'a, T> {
