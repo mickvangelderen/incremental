@@ -1,4 +1,4 @@
-use incremental::{Revision, Global};
+use incremental::{Global, Revision};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -9,7 +9,7 @@ type FileIndex = usize;
 #[derive(Debug, Clone)]
 enum Token {
     Literal(String),
-    Include(PathBuf),
+    Include(SourcePath),
 }
 
 type File = Vec<Token>;
@@ -25,9 +25,16 @@ impl Disk {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+enum SourcePath {
+    File(PathBuf),
+    AttenuationMode,
+    RenderTechnique,
+}
+
 #[derive(Debug)]
 struct CachedFile {
-    path: PathBuf,
+    path: SourcePath,
     last_modified: Revision,
     last_computed: Revision,
     tokens: File,
@@ -36,37 +43,53 @@ struct CachedFile {
 impl CachedFile {
     fn update(&mut self, disk: &Disk) {
         if self.last_computed == self.last_modified {
+            println!("No need to update {:?}, file has not been modified.", self);
             // File is up-to-date.
         } else {
             debug_assert!(self.last_computed < self.last_modified);
             self.last_computed = self.last_modified;
 
             // Read file from disk.
-            self.tokens = disk.read(&self.path);
+            self.tokens = match self.path {
+                SourcePath::File(ref path) => disk.read(path),
+                SourcePath::AttenuationMode => vec![Token::Literal(format!("{}:{}\n", file!(), line!()))],
+                SourcePath::RenderTechnique => vec![Token::Literal(format!("{}:{}\n", file!(), line!()))],
+            };
+
+            println!("Updated {:?}.", self);
         }
+    }
+
+    fn tokens(&self, parent: &mut Revision) -> &File {
+        assert_eq!(self.last_computed, self.last_modified);
+
+        if *parent < self.last_computed {
+            *parent = self.last_computed;
+        }
+
+        &self.tokens
     }
 }
 
 #[derive(Debug)]
 struct Memory {
-    path_to_file_index: HashMap<PathBuf, FileIndex>,
+    path_to_file_index: HashMap<SourcePath, FileIndex>,
     files: Vec<Rc<CachedFile>>,
 }
 
 impl Memory {
-    fn file_index(&mut self, global: &Global, path: impl AsRef<Path>) -> FileIndex {
-        let path = path.as_ref();
+    fn file_index(&mut self, global: &Global, path: &SourcePath) -> FileIndex {
         match self.path_to_file_index.get(path) {
             Some(&file_index) => file_index,
             None => {
                 let file_index = self.files.len();
                 self.files.push(Rc::new(CachedFile {
-                    path: PathBuf::from(path),
+                    path: path.clone(),
                     last_modified: global.revision,
                     last_computed: Revision::DIRTY,
                     tokens: Vec::new(),
                 }));
-                self.path_to_file_index.insert(PathBuf::from(path), file_index);
+                self.path_to_file_index.insert(path.clone(), file_index);
                 file_index
             }
         }
@@ -99,6 +122,7 @@ fn vec_set_add<T: Copy + PartialEq>(vec: &mut Vec<T>, val: T) -> Presence {
 impl EntryPoint {
     fn update(&mut self, global: &Global, mem: &mut Memory, disk: &Disk) {
         if self.last_verified == global.revision {
+            println!("No need to update {:?}, already verified.", self);
             return;
         } else {
             debug_assert!(self.last_verified < global.revision);
@@ -116,6 +140,7 @@ impl EntryPoint {
         }
 
         if should_recompute == false {
+            println!("No need to update {:?}, all dependencies up-to-date.", self);
             return;
         }
 
@@ -135,10 +160,8 @@ impl EntryPoint {
 
             // Clone the file rc so we can access tokens while mutating the tokens vec.
             let file = Rc::clone(&mem.files[file_index]);
-            if ep.last_computed < file.last_modified {
-                ep.last_computed = file.last_modified;
-            }
-            for token in file.tokens.iter() {
+
+            for token in file.tokens(&mut ep.last_computed).iter() {
                 match *token {
                     Token::Literal(ref lit) => {
                         ep.contents.push_str(lit);
@@ -150,6 +173,8 @@ impl EntryPoint {
                 }
             }
         }
+
+        println!("Updated {:?}.", self);
     }
 }
 
@@ -159,10 +184,11 @@ fn main() {
             (
                 PathBuf::from("a.txt"),
                 vec![
+                    Token::Include(SourcePath::AttenuationMode),
                     Token::Literal("a.txt:1\n".to_string()),
-                    Token::Include(PathBuf::from("b.txt")),
+                    Token::Include(SourcePath::File(PathBuf::from("b.txt"))),
                     Token::Literal("a.txt:3\n".to_string()),
-                    Token::Include(PathBuf::from("c.txt")),
+                    Token::Include(SourcePath::File(PathBuf::from("c.txt"))),
                     Token::Literal("a.txt:5\n".to_string()),
                 ],
             ),
@@ -170,13 +196,13 @@ fn main() {
                 PathBuf::from("b.txt"),
                 vec![
                     Token::Literal("b.txt:1\nb.txt:2\n".to_string()),
-                    Token::Include(PathBuf::from("c.txt")),
+                    Token::Include(SourcePath::File(PathBuf::from("c.txt"))),
                 ],
             ),
             (
                 PathBuf::from("c.txt"),
                 vec![
-                    Token::Include(PathBuf::from("a.txt")),
+                    Token::Include(SourcePath::File(PathBuf::from("a.txt"))),
                     Token::Literal("c.txt:1\nc.txt:2\n".to_string()),
                 ],
             ),
@@ -193,7 +219,7 @@ fn main() {
     };
 
     let mut entry = {
-        let file_index = mem.file_index(&global, "a.txt");
+        let file_index = mem.file_index(&global, &SourcePath::File(PathBuf::from("a.txt")));
         EntryPoint {
             file_index,
             last_verified: Revision::DIRTY,
@@ -204,10 +230,11 @@ fn main() {
     };
 
     entry.update(&global, &mut mem, &disk);
+    entry.update(&global, &mut mem, &disk);
+    global.revision.0 += 1;
+    entry.update(&global, &mut mem, &disk);
 
-    println!("{:#?}", &mem);
     println!("{}", &entry.contents);
-    println!("{:?}", &entry.included);
 
     // Simulate some IO, a new file d.txt is added and a.txt is changed.
     disk.files
@@ -217,7 +244,7 @@ fn main() {
         disk.files.get_mut(Path::new("a.txt")).unwrap(),
         vec![
             Token::Literal("a.txt:1\n".to_string()),
-            Token::Include(PathBuf::from("d.txt")),
+            Token::Include(SourcePath::File(PathBuf::from("d.txt"))),
         ],
     );
 
@@ -226,7 +253,5 @@ fn main() {
 
     entry.update(&global, &mut mem, &disk);
 
-    println!("{:#?}", &mem);
     println!("{}", &entry.contents);
-    println!("{:?}", &entry.included);
 }
