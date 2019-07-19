@@ -21,16 +21,17 @@
 //! these realizations I finally felt comfortable resorting to run-time borrow
 //! checking by integrating RefCell.
 
-use std::cell::{Ref, RefCell, RefMut};
-
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct Revision(u64);
+pub struct Revision(pub u64);
 
-const DIRTY_BRANCH: Revision = Revision(0);
+impl Revision {
+    pub const DIRTY: Revision = Revision(0);
+}
+
 const INITIAL_GRAPH: Revision = Revision(1);
 
-/// A Graph represents a network of values which are lazily recomputed.
-/// Graph itself only keeps track of its global revision.
+/// A Global represents a network of values which are lazily recomputed.
+/// Global itself only keeps track of its global revision.
 ///
 /// It is on you to ensure leaves and branches are only used with the graph
 /// they were created in. If you are creating more than one but a fixed
@@ -39,11 +40,11 @@ const INITIAL_GRAPH: Revision = Revision(1);
 /// but might be some day.
 
 #[derive(Debug)]
-pub struct Graph {
-    revision: Revision,
+pub struct Global {
+    pub revision: Revision,
 }
 
-impl Graph {
+impl Global {
     pub fn new() -> Self {
         Self {
             revision: INITIAL_GRAPH,
@@ -52,10 +53,6 @@ impl Graph {
 
     fn inc(&mut self) {
         self.revision.0 += 1;
-    }
-
-    fn revision(&self) -> Revision {
-        self.revision
     }
 
     #[inline]
@@ -88,11 +85,9 @@ impl Graph {
     #[inline]
     pub fn branch<T>(&self, value: T) -> Branch<T> {
         Branch {
-            inner: RefCell::new(BranchInner {
-                value,
-                last_verified: DIRTY_BRANCH,
-                last_modified: DIRTY_BRANCH,
-            }),
+            value,
+            last_verified: Revision::DIRTY,
+            last_computed: Revision::DIRTY,
         }
     }
 
@@ -100,11 +95,23 @@ impl Graph {
     #[inline]
     pub fn clean_branch<T>(&self, value: T) -> Branch<T> {
         Branch {
-            inner: RefCell::new(BranchInner {
-                value,
-                last_verified: self.revision,
-                last_modified: self.revision,
-            }),
+            value,
+            last_verified: self.revision,
+            last_computed: self.revision,
+        }
+    }
+
+    #[inline]
+    pub fn verify<'a, T, F>(&self, branch: &'a mut Branch<T>, f: F) where F: FnOnce(&mut Parent<'a, T>) {
+        if branch.last_verified < self.revision {
+            branch.last_verified = self.revision;
+
+            let mut parent = Parent {
+                revision: branch.last_computed,
+                branch
+            };
+
+            f(&mut parent)
         }
     }
 }
@@ -114,124 +121,38 @@ impl Graph {
 /// their values when queried if necessary.
 #[derive(Debug)]
 pub struct Leaf<T> {
-    value: T,
-    last_modified: Revision,
+    pub value: T,
+    pub last_modified: Revision,
 }
 
-impl<T> Leaf<T> {
-    pub fn read(&self, token: &mut impl Token) -> &T {
-        token.update(self.last_modified);
-        &self.value
-    }
-}
-
-#[derive(Debug)]
-struct BranchInner<T> {
-    value: T,
-    last_modified: Revision,
-    last_verified: Revision,
-}
-
-/// A branch represents a lazily computed cached value. Usually a function
-/// will be dedicated to computing the cased value. This function should
-/// call `verify`.
 #[derive(Debug)]
 pub struct Branch<T> {
-    inner: RefCell<BranchInner<T>>,
+    pub value: T,
+    pub last_verified: Revision,
+    pub last_computed: Revision,
 }
 
-impl<T> Branch<T> {
-    /// The passed closure will be called recomputation is required. A
-    /// branch keeps track of the last time verify was called so that we can
-    /// stop recomputation early when the graph has not been updated at all.
-    ///
-    /// If the graph has been updated since the last verification, the
-    /// passed closure will be called. The closure receives a `ParentToken`
-    /// that should be used to obtain depended-upon Leaf or Branch
-    /// references.
-    ///
-    /// After obtaining all dependencies, `compute` must be called on the
-    /// token.
-    pub fn verify<'a>(
-        &'a self,
-        graph: &'a Graph,
-        token: &mut impl Token,
-        f: impl FnOnce(&mut ParentToken<T>),
-    ) -> Ref<'a, T> {
-        match self.inner.try_borrow_mut() {
-            Ok(mut borrow) => {
-                if borrow.last_verified < graph.revision() {
-                    borrow.last_verified = graph.revision();
+#[derive(Debug)]
+pub struct Parent<'a, T> {
+    pub revision: Revision,
+    pub branch: &'a mut Branch<T>,
+}
 
-                    let mut token = ParentToken {
-                        last_modified: borrow.last_modified,
-                        borrow,
-                    };
-
-                    f(&mut token);
-
-                    debug_assert!(
-                        token.borrow.last_modified == token.last_modified,
-                        "Forgot to call compute!"
-                    );
-                }
-            }
-            Err(_) => {
-                // Branch has already been borrowed which means that it must
-                // also have already been verified for the current graph.
-            }
+impl<'a, T> Parent<'a, T> {
+    pub fn read<'l, U>(&mut self, leaf: &'l Leaf<U>) -> &'l U {
+        if self.revision < leaf.last_modified {
+            self.revision = leaf.last_modified
         }
-        let borrow = self.inner.try_borrow().expect("Cycle detected in dependency graph!");
-
-        token.update(borrow.last_modified);
-
-        Ref::map(borrow, |&BranchInner { ref value, .. }| value)
+        &leaf.value
     }
-}
 
-/// Abstracts the tracking of the latest last_modified value of all
-/// dependencies.
-pub trait Token {
-    fn update(&mut self, revision: Revision);
-}
-
-/// Graph queries need to start somewhere. Do not use this inside
-/// incremental computations. The verify function provides you with a
-/// ParentToken.
-#[derive(Debug)]
-pub struct RootToken;
-
-impl Token for RootToken {
-    fn update(&mut self, _revision: Revision) {
-        // Do nothing.
-    }
-}
-
-/// Tracks the latest last_modified value of all dependencies. After
-/// obtaining references to all dependencies, the compute function must be
-/// called.
-#[derive(Debug)]
-pub struct ParentToken<'a, T> {
-    last_modified: Revision,
-    borrow: RefMut<'a, BranchInner<T>>,
-}
-
-impl<'a, T> ParentToken<'a, T> {
     /// Will execute the passed closure when one of the dependencies has
     /// been modified since the last execution.
     pub fn compute(&mut self, f: impl FnOnce(&mut T)) {
-        if self.borrow.last_modified < self.last_modified {
-            self.borrow.last_modified = self.last_modified;
+        if self.branch.last_computed < self.revision {
+            self.branch.last_computed = self.revision;
 
-            f(&mut self.borrow.value);
-        }
-    }
-}
-
-impl<T> Token for ParentToken<'_, T> {
-    fn update(&mut self, revision: Revision) {
-        if self.last_modified < revision {
-            self.last_modified = revision
+            f(&mut self.branch.value)
         }
     }
 }
