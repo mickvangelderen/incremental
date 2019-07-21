@@ -1,4 +1,4 @@
-use incremental::{Global, Revision};
+use incremental::{Current, LastComputed, LastModified, LastVerified};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -43,16 +43,18 @@ impl SourceReader {
         match *self {
             SourceReader::File(ref path) => {
                 *tokens = disk.read(path);
-            },
+            }
             SourceReader::AttenuationMode => {
-                *tokens = vec![
-                    Token::Literal(format!("#define ATTENUATION_MODE {}\n", vars.attenuation_mode)),
-                ];
+                *tokens = vec![Token::Literal(format!(
+                    "#define ATTENUATION_MODE {}\n",
+                    vars.attenuation_mode
+                ))];
             }
             SourceReader::RenderTechnique => {
-                *tokens = vec![
-                    Token::Literal(format!("#define RENDER_TECHNIQUE {}\n", vars.render_technique)),
-                ];
+                *tokens = vec![Token::Literal(format!(
+                    "#define RENDER_TECHNIQUE {}\n",
+                    vars.render_technique
+                ))];
             }
         }
     }
@@ -61,34 +63,18 @@ impl SourceReader {
 #[derive(Debug)]
 struct Source {
     reader: SourceReader,
-    last_modified: Revision,
-    last_computed: Revision,
+    last_modified: LastModified,
+    last_computed: LastComputed,
     tokens: Tokens,
 }
 
 impl Source {
     fn update(&mut self, disk: &Disk, vars: &Variables) {
-        if self.last_computed == self.last_modified {
-            println!("No need to update {:?}, file has not been modified.", self);
-            // Tokens is up-to-date.
-        } else {
-            debug_assert!(self.last_computed < self.last_modified);
-            self.last_computed = self.last_modified;
-
+        if self.last_computed.should_compute(&self.last_modified) {
+            self.last_computed.update_to(&self.last_modified);
             self.reader.read(&mut self.tokens, disk, vars);
-
             println!("Updated {:?}.", self);
         }
-    }
-
-    fn tokens(&self, parent: &mut Revision) -> &Tokens {
-        assert_eq!(self.last_computed, self.last_modified);
-
-        if *parent < self.last_computed {
-            *parent = self.last_computed;
-        }
-
-        &self.tokens
     }
 }
 
@@ -99,7 +85,7 @@ struct Memory {
 }
 
 impl Memory {
-    fn file_index(&mut self, global: &Global, path: impl AsRef<Path>) -> SourceIndex {
+    fn file_index(&mut self, current: &Current, path: impl AsRef<Path>) -> SourceIndex {
         let path = path.as_ref();
         match self.path_to_file_index.get(path) {
             Some(&file_index) => file_index,
@@ -107,8 +93,8 @@ impl Memory {
                 let file_index = self.files.len();
                 self.files.push(Rc::new(Source {
                     reader: SourceReader::File(PathBuf::from(path)),
-                    last_modified: global.revision,
-                    last_computed: Revision::DIRTY,
+                    last_modified: LastModified::new(current),
+                    last_computed: LastComputed::dirty(),
                     tokens: Vec::new(),
                 }));
                 self.path_to_file_index.insert(PathBuf::from(path), file_index);
@@ -121,8 +107,8 @@ impl Memory {
 #[derive(Debug)]
 struct EntryPoint {
     file_index: SourceIndex,
-    last_verified: Revision,
-    last_computed: Revision,
+    last_verified: LastVerified,
+    last_computed: LastComputed,
     contents: String,
     included: Vec<SourceIndex>,
 }
@@ -142,36 +128,40 @@ fn vec_set_add<T: Copy + PartialEq>(vec: &mut Vec<T>, val: T) -> Presence {
 }
 
 impl EntryPoint {
-    fn update(&mut self, global: &Global, mem: &mut Memory, disk: &Disk, vars: &Variables) {
-        if self.last_verified == global.revision {
-            println!("No need to update {:?}, already verified.", self);
-            return;
+    fn update(&mut self, current: &Current, mem: &mut Memory, disk: &Disk, vars: &Variables) {
+        if self.last_verified.should_verify(current) {
+            self.last_verified.update_to(current);
         } else {
-            debug_assert!(self.last_verified < global.revision);
-            self.last_verified = global.revision;
+            return;
         }
 
         let mut should_recompute = false;
 
         for &include in self.included.iter() {
             let file = &mem.files[include];
-            if self.last_computed < file.last_modified {
+            if self.last_computed.should_compute(&file.last_modified) {
                 should_recompute = true;
                 break;
             }
         }
 
-        if should_recompute == false {
-            println!("No need to update {:?}, all dependencies up-to-date.", self);
-            return;
+        if should_recompute {
+            self.contents.clear();
+            self.included.clear();
+
+            process(self, current, mem, disk, vars, self.file_index);
+
+            println!("Updated {:?}.", self);
         }
 
-        self.contents.clear();
-        self.included.clear();
-
-        process(self, global, mem, disk, vars, self.file_index);
-
-        fn process(ep: &mut EntryPoint, global: &Global, mem: &mut Memory, disk: &Disk, vars: &Variables, file_index: SourceIndex) {
+        fn process(
+            ep: &mut EntryPoint,
+            current: &Current,
+            mem: &mut Memory,
+            disk: &Disk,
+            vars: &Variables,
+            file_index: SourceIndex,
+        ) {
             // Stop processing if we've already included this file.
             if let Presence::Duplicate = vec_set_add(&mut ep.included, file_index) {
                 return;
@@ -183,20 +173,20 @@ impl EntryPoint {
             // Clone the file rc so we can access tokens while mutating the tokens vec.
             let file = Rc::clone(&mem.files[file_index]);
 
-            for token in file.tokens(&mut ep.last_computed).iter() {
+            ep.last_computed.update_to(&file.last_modified);
+
+            for token in file.tokens.iter() {
                 match *token {
                     Token::Literal(ref lit) => {
                         ep.contents.push_str(lit);
                     }
                     Token::Include(ref path) => {
-                        let file_index = mem.file_index(global, path);
-                        process(ep, global, mem, disk, vars, file_index);
+                        let file_index = mem.file_index(current, path);
+                        process(ep, current, mem, disk, vars, file_index);
                     }
                 }
             }
         }
-
-        println!("Updated {:?}.", self);
     }
 }
 
@@ -236,14 +226,14 @@ fn main() {
         .collect(),
     };
 
-    let mut global = Global::new();
+    let mut current = Current::new();
 
     let mut mem = Memory {
         path_to_file_index: HashMap::new(),
         files: Vec::new(),
     };
 
-    let vars = Variables {
+    let mut vars = Variables {
         attenuation_mode: 1,
         render_technique: 6,
     };
@@ -251,36 +241,48 @@ fn main() {
     let attenuation_mode_index = mem.files.len();
     mem.files.push(Rc::new(Source {
         reader: SourceReader::AttenuationMode,
-        last_modified: global.revision,
-        last_computed: Revision::DIRTY,
+        last_modified: LastModified::new(&current),
+        last_computed: LastComputed::dirty(),
         tokens: Vec::new(),
     }));
-    mem.path_to_file_index.insert(attenuation_mode_path, attenuation_mode_index);
+    mem.path_to_file_index
+        .insert(attenuation_mode_path, attenuation_mode_index);
 
     let render_technique_index = mem.files.len();
     mem.files.push(Rc::new(Source {
         reader: SourceReader::RenderTechnique,
-        last_modified: global.revision,
-        last_computed: Revision::DIRTY,
+        last_modified: LastModified::new(&current),
+        last_computed: LastComputed::dirty(),
         tokens: Vec::new(),
     }));
-    mem.path_to_file_index.insert(render_technique_path, render_technique_index);
+    mem.path_to_file_index
+        .insert(render_technique_path, render_technique_index);
 
     let mut entry = {
-        let file_index = mem.file_index(&global, "a.txt");
+        let file_index = mem.file_index(&current, "a.txt");
         EntryPoint {
             file_index,
-            last_verified: Revision::DIRTY,
-            last_computed: Revision::DIRTY,
+            last_verified: LastVerified::dirty(),
+            last_computed: LastComputed::dirty(),
             contents: String::new(),
             included: vec![file_index],
         }
     };
 
-    entry.update(&global, &mut mem, &disk, &vars);
-    entry.update(&global, &mut mem, &disk, &vars);
-    global.revision.0 += 1;
-    entry.update(&global, &mut mem, &disk, &vars);
+    entry.update(&current, &mut mem, &disk, &vars);
+    entry.update(&current, &mut mem, &disk, &vars);
+    {
+        let mut dummy = LastModified::new(&current);
+        dummy.modify(&mut current);
+    }
+    entry.update(&current, &mut mem, &disk, &vars);
+
+    println!("{}", &entry.contents);
+
+    vars.attenuation_mode = 13;
+    Rc::get_mut(&mut mem.files[attenuation_mode_index]).unwrap().last_modified.modify(&mut current);
+
+    entry.update(&current, &mut mem, &disk, &vars);
 
     println!("{}", &entry.contents);
 
@@ -296,10 +298,10 @@ fn main() {
         ],
     );
 
-    global.revision.0 += 1;
-    Rc::get_mut(&mut mem.files[entry.file_index]).unwrap().last_modified = global.revision;
+    Rc::get_mut(&mut mem.files[entry.file_index]).unwrap().last_modified.modify(&mut current);
 
-    entry.update(&global, &mut mem, &disk, &vars);
+    entry.update(&current, &mut mem, &disk, &vars);
 
     println!("{}", &entry.contents);
+
 }
