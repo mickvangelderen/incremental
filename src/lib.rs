@@ -1,3 +1,18 @@
+//! This is more of a philosophy than a library
+
+pub trait Dependee {
+    fn revision(&self) -> Revision;
+}
+
+#[derive(Debug)]
+pub struct Current(Revision);
+
+impl Current {
+    pub fn new() -> Self {
+        Self(Revision::INITIAL_CURRENT)
+    }
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Revision(u64);
 
@@ -8,15 +23,6 @@ impl Revision {
 
 #[derive(Debug)]
 pub struct LastVerified(Revision);
-
-#[derive(Debug)]
-pub struct LastModified(Revision);
-
-#[derive(Debug)]
-pub struct LastComputed(Revision);
-
-#[derive(Debug)]
-pub struct Current(Revision);
 
 impl LastVerified {
     pub fn clean(current: &Current) -> Self {
@@ -44,6 +50,29 @@ impl LastVerified {
     }
 }
 
+#[derive(Debug)]
+pub struct LastModified(Revision);
+
+impl LastModified {
+    pub fn new(current: &Current) -> Self {
+        Self(current.0)
+    }
+
+    pub fn modify(&mut self, current: &mut Current) {
+        (current.0).0 += 1;
+        self.0 = current.0;
+    }
+}
+
+impl Dependee for LastModified {
+    fn revision(&self) -> Revision {
+        self.0
+    }
+}
+
+#[derive(Debug)]
+pub struct LastComputed(Revision);
+
 impl LastComputed {
     pub fn clean(current: &Current) -> Self {
         Self(current.0)
@@ -58,39 +87,15 @@ impl LastComputed {
     }
 
     pub fn update_to(&mut self, dependee: &impl Dependee) {
-        self.0 = dependee.revision()
+        let revision = dependee.revision();
+        if self.0 < revision {
+            self.0 = revision
+        }
     }
-}
-
-impl LastModified {
-    pub fn new(current: &Current) -> Self {
-        Self(current.0)
-    }
-
-    pub fn modify(&mut self, current: &mut Current) {
-        (current.0).0 += 1;
-        self.0 = current.0;
-    }
-}
-
-pub trait Dependee {
-    fn revision(&self) -> Revision;
 }
 
 impl Dependee for LastComputed {
     fn revision(&self) -> Revision {
         self.0
-    }
-}
-
-impl Dependee for LastModified {
-    fn revision(&self) -> Revision {
-        self.0
-    }
-}
-
-impl Current {
-    pub fn new() -> Self {
-        Self(Revision::INITIAL_CURRENT)
     }
 }
